@@ -1,22 +1,33 @@
 #include <Arduino.h>
 
-#include <Wire.h>
+// Flash memory
+#include <Preferences.h>
+
+// Sensor and actuator libaries
+#include <ESP32Servo.h>
 #include "SparkFun_VCNL4040_Arduino_Library.h"
 
+// Protocol libraries
 #include <BLEDevice.h>
 #include <BLEServer.h>
-
-#include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
 
-// Add #define variables for WiFi
-#define SERVICE_UUID "3bb82dd9-afb3-43d3-9c76-f11f090a0cd1"
-#define CHARACTERISTIC_UUID "e02ea3fb-6475-4194-b337-583245497450"
-#define LED_12 12 // for sensor testing only
-#define LED_13 13 // for BLE testing only
+// Defined constants
+#define LED_12 12
+#define SERVO_15 15
+#define MAIL_ENDPOINT "https://y96ey5lzna.execute-api.us-west-1.amazonaws.com/dev/mail"
+#define SERVICE_UUID "00000000-0000-0000-0000-00000000000a"
+#define SSID_CHARACTERISTIC_UUID "10000000-0000-0000-0000-00000000000a"
+#define PASSWORD_CHARACTERISTIC_UUID "10000000-0000-0000-0000-00000000000b"
+#define UID_CHARACTERISTIC_UUID "10000000-0000-0000-0000-00000000000c"
 
+// Global declarations
+Preferences preferences;
+Servo servoLock;
 VCNL4040 proximitySensor;
-
 bool deviceConnected = false;
 
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -32,31 +43,92 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
 void setup() {
   Serial.begin(9600);
-
   pinMode(LED_12, OUTPUT);
-  pinMode(LED_13, OUTPUT);
+  servoLock.attach(SERVO_15);
 
   Wire.begin();
   if (proximitySensor.begin() == false)
   {
-    Serial.println("Device not found. Please check wiring.");
-    while (1);
+    Serial.println("Sensor not found. Please check wiring.");
+    bool ledOn = false;
+    while (1) {
+      if (ledOn) {
+        digitalWrite(LED_12, LOW);
+        ledOn = false;
+      } else {
+        digitalWrite(LED_12, HIGH);
+        ledOn = true;
+      }
+      delay(100);
+    }
   }
+
+  // BLE Characteristics
+  BLECharacteristic *ssidCharacteristic = new BLECharacteristic(SSID_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *passwordCharacteristic = new BLECharacteristic(PASSWORD_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *uidCharacteristic = new BLECharacteristic(UID_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_WRITE);
 
   BLEDevice::init("Security Mailbox");
   BLEServer *server = BLEDevice::createServer();
   server->setCallbacks(new MyServerCallbacks());
   BLEService *service = server->createService(SERVICE_UUID);
+  service->addCharacteristic(ssidCharacteristic);
+  service->addCharacteristic(passwordCharacteristic);
+  service->addCharacteristic(uidCharacteristic);
   service->start();
   BLEAdvertising *advertising = server->getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
   advertising->start();
   Serial.println("BLE setup complete");
 
-  delay(1000);
+  delay(3000);
+
+  preferences.begin("credentials", false);
+
+  // To test setup
+  // preferences.clear();
+
+  if (!preferences.getBool("setup")) {
+    Serial.println("Configuring device");
+
+    bool foundSSID = false;
+    bool foundPassword = false;
+    bool foundUID = false;
+    while (!foundSSID || !foundPassword || !foundUID) {
+      if (!foundSSID) {
+        String ssid = service->getCharacteristic(SSID_CHARACTERISTIC_UUID)->getValue().c_str();
+        if (ssid != "") {
+          preferences.putString("ssid", ssid);
+          Serial.println(preferences.getString("ssid"));
+          foundSSID = true;
+        }
+      }
+      if (!foundPassword) {
+        String password = service->getCharacteristic(PASSWORD_CHARACTERISTIC_UUID)->getValue().c_str();
+        if (password != "") {
+          preferences.putString("password", password);
+          Serial.println(preferences.getString("password"));
+          foundPassword = true;
+        }
+      }
+      if (!foundUID) {
+        String uid = service->getCharacteristic(UID_CHARACTERISTIC_UUID)->getValue().c_str();
+        if (uid != "") {
+          preferences.putString("uid", uid);
+          Serial.println(preferences.getString("uid"));
+          foundUID = true;
+        }
+      }
+      delay(500);
+    }
+
+    preferences.putBool("setup", true);
+  }
+  Serial.println("Device configured");
 
   Serial.print("Connecting to ");
-  Serial.println(WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println(preferences.getString("ssid"));
+  WiFi.begin(preferences.getString("ssid"), preferences.getString("password"));
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -69,15 +141,17 @@ void loop() {
   unsigned int proxValue = proximitySensor.getProximity();
   Serial.println(proxValue);
   if (proxValue > 100) {
-    digitalWrite(LED_12, HIGH);
+    WiFiClientSecure *client = new WiFiClientSecure;
+    if (client) {
+      client->setInsecure();
+    }
 
-    WiFiClient client;
     HTTPClient http;
-    http.begin(client, MAIL_ENDPOINT);
+    http.begin(*client, MAIL_ENDPOINT);
     http.addHeader("Content-Type", "application/json");
 
-    int httpResponseCode = http.POST(MAIL_REQUEST_BODY);
-
+    String responseBody = "{\"uid\": " + preferences.getString("uid") + "}";
+    int httpResponseCode = http.POST(responseBody);
     if (httpResponseCode > 0) {
       String response = http.getString();
       Serial.println(httpResponseCode);
@@ -86,13 +160,11 @@ void loop() {
       Serial.printf("Error occurred while sending HTTP POST");
     }
     delay(1000);
-  } else {
-    digitalWrite(LED_12, LOW);
   }
 
   if (deviceConnected) {
-    digitalWrite(LED_13, HIGH);
+    servoLock.write(90);
   } else {
-    digitalWrite(LED_13, LOW);
+    servoLock.write(0);
   }
 }
