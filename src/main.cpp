@@ -16,12 +16,13 @@
 #include <Wire.h>
 
 // Defined constants
-#define LED_12 12
 #define SERVO_15 15
 #define SDA_2 32
 #define SCL_2 33
 #define I2C_freq 100000
-#define MAIL_ENDPOINT "https://y96ey5lzna.execute-api.us-west-1.amazonaws.com/dev/mail"
+#define TIME_ENDPOINT "https://y96ey5lzna.execute-api.us-west-1.amazonaws.com/dev/mail"
+#define NOTIFY_ENDPOINT "https://y96ey5lzna.execute-api.us-west-1.amazonaws.com/dev/notify"
+#define DETECTION_ENDPOINT "https://y96ey5lzna.execute-api.us-west-1.amazonaws.com/dev/mailbox_status"
 #define SERVICE_UUID "00000000-0000-0000-0000-00000000000a"
 #define SSID_CHARACTERISTIC_UUID "10000000-0000-0000-0000-00000000000a"
 #define PASSWORD_CHARACTERISTIC_UUID "10000000-0000-0000-0000-00000000000b"
@@ -33,6 +34,11 @@ Servo servoLock;
 VCNL4040 timeProximitySensor;
 VCNL4040 detectionProximitySensor;
 bool deviceConnected = false;
+bool mailDetected = false;
+WiFiClientSecure *client = new WiFiClientSecure;
+HTTPClient httpTime;
+HTTPClient httpNotify;
+HTTPClient httpDetection;
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* server) {
@@ -47,39 +53,19 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
 void setup() {
   Serial.begin(9600);
-  pinMode(LED_12, OUTPUT);
-  servoLock.attach(SERVO_15);
 
+  servoLock.attach(SERVO_15);
   Wire.begin();
   if (timeProximitySensor.begin() == false)
   {
     Serial.println("Time of mail sensor not found. Please check wiring.");
-    bool ledOn = false;
     while (1) {
-      if (ledOn) {
-        digitalWrite(LED_12, LOW);
-        ledOn = false;
-      } else {
-        digitalWrite(LED_12, HIGH);
-        ledOn = true;
-      }
-      delay(100);
     }
   }
-
   Wire1.begin(SDA_2, SCL_2, I2C_freq);
   if (detectionProximitySensor.begin(Wire1) == false) {
     Serial.println("Detection of mail sensor not found. Please check wiring.");
-    bool ledOn = false;
     while (1) {
-      if (ledOn) {
-        digitalWrite(LED_12, LOW);
-        ledOn = false;
-      } else {
-        digitalWrite(LED_12, HIGH);
-        ledOn = true;
-      }
-      delay(100);
     }
   }
 
@@ -155,36 +141,65 @@ void setup() {
   }
   Serial.println("");
   Serial.println("WiFi connected");
+
+  if (client) {
+      client->setInsecure();
+    }
+  httpTime.begin(*client, TIME_ENDPOINT);
+  httpTime.addHeader("Content-Type", "application/json");
+  httpNotify.begin(*client, NOTIFY_ENDPOINT);
+  httpNotify.addHeader("Content-Type", "application/json");
+  httpDetection.begin(*client, DETECTION_ENDPOINT);
+  httpDetection.addHeader("Content-Type", "application/json");
 }
 
 void loop() {
   unsigned int timeSensorValue = timeProximitySensor.getProximity();
   if (timeSensorValue > 100) { // update threshold according to physical mailbox design
-    WiFiClientSecure *client = new WiFiClientSecure;
-    if (client) {
-      client->setInsecure();
-    }
+    String uidRequestBody = "{\"uid\": " + preferences.getString("uid") + "}";
+    int httpTimeResponseCode = httpTime.POST(uidRequestBody);
+    if (httpTimeResponseCode == 200) {
+      Serial.println("Time request sent successfully.");
 
-    HTTPClient http;
-    http.begin(*client, MAIL_ENDPOINT);
-    http.addHeader("Content-Type", "application/json");
-
-    String responseBody = "{\"uid\": " + preferences.getString("uid") + "}";
-    int httpResponseCode = http.POST(responseBody);
-    if (httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.println(httpResponseCode);
-      Serial.println(response);
+      int httpNotifyResponseCode = httpNotify.POST(uidRequestBody);
+      if (httpNotifyResponseCode == 200) {
+        Serial.println("Notify request sent successfully.");
+      } else {
+        Serial.println("Error sending notify request.");
+        Serial.println(httpNotify.getString());
+      }
     } else {
-      Serial.printf("Error occurred while sending HTTP POST");
+      Serial.println("Error sending time request.");
+      Serial.println(httpTime.getString());
     }
     delay(1000);
   }
 
   unsigned int detectionSensorValue = detectionProximitySensor.getProximity();
-  if (detectionSensorValue > 1000) {
-    Serial.println("Mail detected");
-    // Send detection data to backend
+  if (detectionSensorValue > 1000 && !mailDetected) {
+    mailDetected = true;
+    Serial.println("New mail detected.");
+
+    String detectionRequestBody = "{\"uid\": " + preferences.getString("uid") + ", \"contains_mail\": true}";
+    int httpDetectionResponseCode = httpDetection.POST(detectionRequestBody);
+    if (httpDetectionResponseCode == 200) {
+      Serial.println("Detection request sent successfully.");
+    } else {
+      Serial.println("Error sending detection request.");
+      Serial.println(httpDetection.getString());
+    }
+  } else if (detectionSensorValue <= 1000 && mailDetected) {
+    mailDetected = false;
+    Serial.println("Mail removed.");
+
+    String detectionRequestBody = "{\"uid\": " + preferences.getString("uid") + ", \"contains_mail\": false}";
+    int httpDetectionResponseCode = httpDetection.POST(detectionRequestBody);
+    if (httpDetectionResponseCode == 200) {
+      Serial.println("Detection request sent successfully.");
+    } else {
+      Serial.println("Error sending detection request.");
+      Serial.println(httpDetection.getString());
+    }
   }
 
   if (deviceConnected) {
